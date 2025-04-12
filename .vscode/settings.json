@@ -1,0 +1,20 @@
+{
+  "[python]": {
+    "editor.defaultFormatter": "ms-python.black-formatter",
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+      "source.organizeImports": "explicit"
+    },
+    "editor.formatOnType": true
+  },
+  "python.analysis.extraPaths": ["${workspaceFolder}/script"],
+  "isort.args": ["--profile", "black"],
+  "black-formatter.path": ["black"],
+  "black-formatter.args": ["--line-length", "100"],
+  // Words to add to dictionary for a workspace.
+  "cSpell.words": ["boto", "psycopg", "pytest", "DAAE"],
+  // Enable / Disable compound words like 'errormessage'
+  "cSpell.allowCompoundWords": true,
+  "python.defaultInterpreterPath": "${workspaceFolder}/venv/bin/python",
+  "python.languageServer": "Pylance"
+}
