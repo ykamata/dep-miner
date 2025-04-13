@@ -12,11 +12,15 @@ def copy_file(src: str, dest: str) -> None:
     Copy a file from source to destination, creating destination directories if needed.
 
     Args:
-        src (str): Source file path
-        dest (str): Destination file path
+        src (str): Source file path to copy from
+        dest (str): Destination file path to copy to
 
     Returns:
         None
+
+    This function:
+    1. Creates any missing parent directories for the destination path
+    2. Copies the file while preserving metadata (timestamps, permissions)
     """
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     shutil.copy2(src, dest)
@@ -39,8 +43,8 @@ def distribute_modules(
 
     This function:
     1. Creates the destination directory if it doesn't exist
-    2. Copies each imported module from source to destination
-    3. Creates a requirements.txt file with third-party dependencies
+    2. Copies each imported module from source to destination, preserving directory structure
+    3. Creates a requirements.txt file listing all third-party dependencies
     """
     os.makedirs(dist_dir, exist_ok=True)
     for module in imports:
@@ -61,7 +65,8 @@ def distribute_modules(
 
 
 def is_standard_lib(module_name: str, std_lib_modules: Set[str]) -> bool:
-    """Check if a module is part of the standard library.
+    """
+    Check if a module is part of the Python standard library.
 
     Args:
         module_name (str): Name of the module to check
@@ -73,6 +78,7 @@ def is_standard_lib(module_name: str, std_lib_modules: Set[str]) -> bool:
     This function checks if a given module is part of Python's standard library by:
     1. Checking if it exists in the provided std_lib_modules set
     2. Finding the module spec and checking if its origin path is within the standard library directory
+    3. Returns False if module spec cannot be found or has no origin path
     """
     if module_name in std_lib_modules:
         return True
@@ -91,7 +97,8 @@ def is_standard_lib(module_name: str, std_lib_modules: Set[str]) -> bool:
 
 
 def is_third_party(module_name: str, package_paths: Set[str]) -> bool:
-    """Check if a module is part of the third party library.
+    """
+    Check if a module is from a third-party package.
 
     Args:
         module_name (str): Name of the module to check
@@ -103,7 +110,7 @@ def is_third_party(module_name: str, package_paths: Set[str]) -> bool:
     This function checks if a given module is from a third party package by:
     1. Attempting to import the module
     2. Checking if its file path starts with any of the provided package paths
-    3. Returns False if module cannot be imported
+    3. Returns False if module cannot be imported or has no file path
     """
     try:
         module = importlib.import_module(module_name)
@@ -112,8 +119,32 @@ def is_third_party(module_name: str, package_paths: Set[str]) -> bool:
         return False
 
 
+def is_namespace_package(module_name: str) -> bool:
+    """
+    Check if a module is a namespace package.
+
+    Args:
+        module_name (str): Name of the module to check
+
+    Returns:
+        bool: True if module is a namespace package, False otherwise
+
+    This function determines if a module is a namespace package by:
+    1. Attempting to import the module
+    2. Checking if it has a __path__ attribute (indicating a package)
+    3. Checking if it lacks a __file__ attribute (indicating namespace package)
+    4. Returns False if module cannot be imported
+    """
+    try:
+        module = importlib.import_module(module_name)
+        return hasattr(module, "__path__") and not hasattr(module, "__file__")
+    except ImportError:
+        return False
+
+
 def is_first_party(module_name: str, current_dir: str) -> bool:
-    """Check if a module is part of the first party library.
+    """
+    Check if a module is a first-party (local project) module.
 
     Args:
         module_name (str): Name of the module to check
@@ -122,35 +153,98 @@ def is_first_party(module_name: str, current_dir: str) -> bool:
     Returns:
         bool: True if module is a first party module, False otherwise
 
-    This function checks if a given module is a first party module by:
-    1. Attempting to import the module
-    2. Checking that it's not in a virtual environment (.venv)
-    3. Verifying the module file path starts with the current directory
-    4. Returns False if module cannot be imported
+    This function determines if a module is a first party module by checking:
+    1. If the module can be imported successfully
+    2. If the module has a valid file path
+    3. If the module is not in a virtual environment (.venv, venv, etc)
+    4. If the module is not a pip editable install
+    5. If the module file path starts with the current directory
+    6. Handles special cases for:
+        - Zip imports
+        - Compiled extensions (.pyd, .so files)
+        - Namespace packages
+        - Frozen modules
     """
     try:
         module = importlib.import_module(module_name)
-        if ".venv" in module.__file__:
+        module_file = getattr(module, "__file__", None)
+
+        # Skip if module doesn't have a file path
+        if module_file is None:
             return False
-        return module.__file__.startswith(current_dir)
+
+        # Handle zip imports
+        if module_file and ".zip" in module_file:
+            zip_path = module_file.split(".zip")[0] + ".zip"
+            return zip_path.startswith(current_dir)
+
+        # Handle compiled extensions (.pyd, .so files)
+        if module_file.endswith((".pyd", ".so")):
+            return module_file.startswith(current_dir)
+
+        # Handle namespace packages
+        if is_namespace_package(module_name):
+            return any(path.startswith(current_dir) for path in module.__path__)
+
+        # Handle frozen modules
+        if hasattr(module, "__spec__") and module.__spec__.origin == "frozen":
+            return False
+
+        # Check for common virtual environment patterns
+        if any(
+            pattern in module_file
+            for pattern in [
+                ".venv",
+                "venv",
+                "virtualenv",
+                "poetry/virtualenvs",
+                "conda",
+                "env",
+                "envs",
+                ".tox",  # For tox testing environments
+            ]
+        ):
+            return False
+
+        # Check for pip editable installs
+        if ".egg-link" in module_file:
+            return False
+
+        return module_file.startswith(current_dir)
     except ImportError:
         return False
 
 
 def get_package_paths() -> Set[str]:
-    """Get paths to third party package directories.
+    """
+    Get paths to all third-party package installation directories.
 
     Returns:
         Set[str]: Set of paths to directories containing installed packages
 
     This function:
     1. Iterates through Python's sys.path
-    2. Collects paths containing 'site-packages' or 'dist-packages'
-    3. Returns set of package installation directories
+    2. Collects paths containing:
+        - site-packages: System-wide installed packages
+        - dist-packages: Distribution-specific packages
+        - .local/lib/python: User-installed packages on Unix systems
+        - AppData/Local/Programs/Python: User-installed packages on Windows
+        - Library/Python: User-installed packages on macOS
+    3. Returns a set of all package installation directories found
     """
     paths = set()
     for path in sys.path:
-        if "site-packages" in path or "dist-packages" in path:
+        # if "site-packages" in path or "dist-packages" in path:
+        if any(
+            pattern in path
+            for pattern in [
+                "site-packages",
+                "dist-packages",
+                ".local/lib/python",  # User-installed packages on Unix-like systems
+                "AppData/Local/Programs/Python",  # User-installed packages on Windows
+                "Library/Python",  # macOS user packages
+            ]
+        ):
             paths.add(path)
     return paths
 
@@ -161,7 +255,8 @@ def _handle_import_from(
     current_dir: str,
     package_paths: Set[str],
 ) -> tuple[set, set]:
-    """Handle ImportFrom node processing.
+    """
+    Process an ImportFrom AST node to classify the imported module.
 
     Args:
         module (str): Name of the imported module
@@ -175,10 +270,12 @@ def _handle_import_from(
             - Set of third party package requirements
 
     This function processes an ImportFrom AST node by:
-    1. Checking if module is empty
-    2. Determining if module is standard library, first party, or third party
-    3. Adding first party modules to imports set
-    4. Adding third party packages to requirements set
+    1. Checking if module name is empty
+    2. Determining module type:
+        - Standard library module (ignored)
+        - First party module (added to imports set)
+        - Third party package (added to requirements set)
+    3. Returns sets of discovered imports and requirements
     """
     imports = set()
     requirements = set()
@@ -202,7 +299,8 @@ def _handle_import(
     current_dir: str,
     package_paths: Set[str],
 ) -> tuple[set, set]:
-    """Handle Import node processing.
+    """
+    Process an Import AST node to classify the imported module.
 
     Args:
         alias_name (str): Name of the imported module/alias
@@ -216,10 +314,11 @@ def _handle_import(
             - Set of third party package requirements
 
     This function processes an Import AST node by:
-    1. Checking if module is standard library
-    2. Determining if module is first party or third party
-    3. Adding first party modules to imports set
-    4. Adding third party packages to requirements set
+    1. Determining module type:
+        - Standard library module (ignored)
+        - First party module (added to imports set)
+        - Third party package (added to requirements set)
+    2. Returns sets of discovered imports and requirements
     """
     imports = set()
     requirements = set()
@@ -240,7 +339,8 @@ def parse_imports(
     package_paths: Set[str],
     current_dir: str,
 ) -> tuple[Set[str], Set[str]]:
-    """Parse Python file and extract import dependencies.
+    """
+    Parse a Python file and extract all import dependencies.
 
     Args:
         file_path (str): Path to Python file to parse
@@ -254,13 +354,13 @@ def parse_imports(
             - Set of third party package requirements
 
     This function:
-    1. Parses the Python file into an AST
-    2. Iterates through Import and ImportFrom nodes
-    3. Processes each import to determine if it is:
-       - Standard library (ignored)
-       - First party module (added to imports)
-       - Third party package (added to requirements)
-    4. Returns sets of first party imports and third party requirements
+    1. Reads and parses the Python file into an AST
+    2. Iterates through all Import and ImportFrom nodes
+    3. Classifies each imported module as:
+        - Standard library module (ignored)
+        - First party module (added to imports set)
+        - Third party package (added to requirements set)
+    4. Returns combined sets of all discovered imports and requirements
     """
     with open(file_path, "r") as f:
         node = ast.parse(f.read(), file_path)
@@ -270,17 +370,13 @@ def parse_imports(
 
     for n in ast.iter_child_nodes(node):
         if isinstance(n, ast.ImportFrom):
-            imp, req = _handle_import_from(
-                n.module, std_lib_modules, current_dir, package_paths
-            )
+            imp, req = _handle_import_from(n.module, std_lib_modules, current_dir, package_paths)
             imports.update(imp)
             requirements.update(req)
 
         elif isinstance(n, ast.Import):
             for alias in n.names:
-                imp, req = _handle_import(
-                    alias.name, std_lib_modules, current_dir, package_paths
-                )
+                imp, req = _handle_import(alias.name, std_lib_modules, current_dir, package_paths)
                 imports.update(imp)
                 requirements.update(req)
 
@@ -289,20 +385,20 @@ def parse_imports(
 
 def gather_dependencies() -> None:
     """
-    Gather and distribute dependencies for Lambda functions.
+    Gather and distribute dependencies for all Lambda functions.
 
     This function:
-    1. Gets standard library modules and package paths
-    2. For each Lambda directory in SRC_DIR:
+    1. Gets standard library modules and package installation paths
+    2. For each Lambda function directory in SRC_DIR:
         - Analyzes imports in the handler.py file
         - Recursively analyzes imports in all dependent modules
         - Copies handler file and all dependencies to dist directory
         - Creates requirements.txt with third party dependencies
 
     The function handles three types of dependencies:
-    - Standard library modules (ignored)
-    - First party modules (copied to dist)
-    - Third party packages (added to requirements.txt)
+    - Standard library modules: Ignored since they're available in Lambda runtime
+    - First party modules: Copied to dist directory maintaining package structure
+    - Third party packages: Added to requirements.txt for installation
 
     Returns:
         None
@@ -329,9 +425,7 @@ def gather_dependencies() -> None:
                 queue = _imports.copy()
                 while queue:
                     m = queue.pop()
-                    module_path = os.path.join(
-                        current_dir, "src", f"{m.replace('.', os.sep)}.py"
-                    )
+                    module_path = os.path.join(current_dir, "src", f"{m.replace('.', os.sep)}.py")
                     __imports, __requirements = parse_imports(
                         module_path,
                         std_lib_modules,
@@ -346,9 +440,7 @@ def gather_dependencies() -> None:
                 # add module's dependencies
                 src_dir = os.path.join(current_dir, "src")
                 dist_dit = os.path.join(DIST_DIR, lambda_dir)
-                copy_file(
-                    lambda_file, os.path.join(dist_dit, HANDLER_FILE_NAME)
-                )
+                copy_file(lambda_file, os.path.join(dist_dit, HANDLER_FILE_NAME))
                 distribute_modules(imports, requirements, src_dir, dist_dit)
 
 
